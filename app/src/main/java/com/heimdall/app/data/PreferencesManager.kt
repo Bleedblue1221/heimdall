@@ -2,6 +2,9 @@ package com.heimdall.app.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
+import androidx.compose.runtime.mutableLongStateOf
 import com.heimdall.app.util.CategoryHelper
 import org.json.JSONArray
 import org.json.JSONObject
@@ -24,11 +27,15 @@ class PreferencesManager(context: Context) {
     private var memoryMessagesCache: MutableList<InspectedMessage>? = null
 
     companion object {
+        val messagesVersion = mutableLongStateOf(0L)
+
         private const val KEY_MASTER_ACTIVE = "master_active"
         private const val KEY_FILTER_ENABLED = "filter_enabled"
         private const val KEY_KEYWORDS = "filtered_keywords"
         private const val KEY_BLOCKED_COUNT = "blocked_count"
         private const val KEY_INSPECTED_LOGS = "inspected_logs"
+        private const val KEY_LAST_SPAM_CLEANUP = "last_spam_cleanup"
+        private const val KEY_SHOW_SPAM_IN_FEED = "show_spam_in_feed"
 
         val DEFAULT_KEYWORDS = setOf(
             "loan",
@@ -58,6 +65,15 @@ class PreferencesManager(context: Context) {
 
     fun setFilterEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_FILTER_ENABLED, enabled).apply()
+    }
+
+    // Show/Hide Spam in Main Feed
+    fun isShowSpamInFeed(): Boolean {
+        return prefs.getBoolean(KEY_SHOW_SPAM_IN_FEED, false)
+    }
+
+    fun setShowSpamInFeed(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_SHOW_SPAM_IN_FEED, enabled).apply()
     }
 
     fun isShieldEnabled(): Boolean = isMasterActive()
@@ -96,6 +112,12 @@ class PreferencesManager(context: Context) {
         prefs.edit().putInt(KEY_BLOCKED_COUNT, current + 1).apply()
     }
 
+    private fun notifyMessagesChanged() {
+        Handler(Looper.getMainLooper()).post {
+            messagesVersion.longValue++
+        }
+    }
+
     // High-performance in-memory add with async background persistence
     @Synchronized
     fun addInspectedMessage(message: InspectedMessage) {
@@ -104,6 +126,7 @@ class PreferencesManager(context: Context) {
         val trimmedList = if (list.size > 100) list.take(100).toMutableList() else list
         memoryMessagesCache = trimmedList
         saveMessagesAsync(trimmedList)
+        notifyMessagesChanged()
     }
 
     @Synchronized
@@ -114,6 +137,7 @@ class PreferencesManager(context: Context) {
             list[idx] = list[idx].copy(isRead = true)
             memoryMessagesCache = list
             saveMessagesAsync(list)
+            notifyMessagesChanged()
             return true
         }
         return false
@@ -132,6 +156,7 @@ class PreferencesManager(context: Context) {
         if (count > 0) {
             memoryMessagesCache = list
             saveMessagesAsync(list)
+            notifyMessagesChanged()
         }
         return count
     }
@@ -147,6 +172,7 @@ class PreferencesManager(context: Context) {
         if (removed) {
             memoryMessagesCache = list
             saveMessagesAsync(list)
+            notifyMessagesChanged()
         }
         return removed
     }
@@ -158,7 +184,34 @@ class PreferencesManager(context: Context) {
         val cleanList = list.filter { !it.isSpam }.toMutableList()
         memoryMessagesCache = cleanList
         saveMessagesAsync(cleanList)
+        notifyMessagesChanged()
         return spamCount
+    }
+
+    @Synchronized
+    fun cleanupOldSpam(
+        maxAgeMillis: Long = 30L * 24 * 60 * 60 * 1000L,
+        force: Boolean = false
+    ): Int {
+        val now = System.currentTimeMillis()
+        val lastCleanup = prefs.getLong(KEY_LAST_SPAM_CLEANUP, 0L)
+        if (!force && (now - lastCleanup < 24L * 60 * 60 * 1000L)) {
+            return 0
+        }
+
+        prefs.edit().putLong(KEY_LAST_SPAM_CLEANUP, now).apply()
+
+        val cutoff = now - maxAgeMillis
+        val list = getInspectedMessagesInternal()
+        val initialSize = list.size
+        val filtered = list.filterNot { it.isSpam && it.timestamp < cutoff }.toMutableList()
+        val deleted = initialSize - filtered.size
+        if (deleted > 0) {
+            memoryMessagesCache = filtered
+            saveMessagesAsync(filtered)
+            notifyMessagesChanged()
+        }
+        return deleted
     }
 
     // Instant O(1) in-memory retrieval

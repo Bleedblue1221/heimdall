@@ -13,12 +13,17 @@ import com.heimdall.app.receiver.CopyOtpReceiver
 object NotificationHelper {
 
     private const val CHANNEL_ID_SPAM = "heimdall_spam_alerts"
-    private const val CHANNEL_ID_CLEAN = "heimdall_clean_alerts"
+    private const val CHANNEL_ID_CLEAN = "heimdall_clean_messages_v2"
     const val EXTRA_MESSAGE_TIMESTAMP = "extra_message_timestamp"
 
-    private fun createNotificationChannels(context: Context) {
+    fun createNotificationChannels(context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+            // Remove legacy silent channel if present
+            try {
+                notificationManager.deleteNotificationChannel("heimdall_clean_alerts")
+            } catch (_: Exception) {}
 
             val spamChannel = NotificationChannel(
                 CHANNEL_ID_SPAM,
@@ -31,11 +36,11 @@ object NotificationHelper {
 
             val cleanChannel = NotificationChannel(
                 CHANNEL_ID_CLEAN,
-                "Heimdall Clean Feed",
-                NotificationManager.IMPORTANCE_LOW
+                "Heimdall Messages",
+                NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                description = "Subtle feed alerts for verified clean SMS"
-                enableVibration(false)
+                description = "Primary incoming SMS and OTP alerts"
+                enableVibration(true)
             }
 
             notificationManager.createNotificationChannel(spamChannel)
@@ -83,7 +88,7 @@ object NotificationHelper {
             .setContentTitle(title)
             .setContentText(content)
             .setStyle(NotificationCompat.BigTextStyle().bigText(content))
-            .setPriority(if (isSpam) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_LOW)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
             .setContentIntent(pendingOpenIntent)
 
@@ -92,6 +97,8 @@ object NotificationHelper {
         if (extractedOtp != null) {
             val copyIntent = Intent(context, CopyOtpReceiver::class.java).apply {
                 putExtra(CopyOtpReceiver.EXTRA_OTP_CODE, extractedOtp)
+                putExtra(CopyOtpReceiver.EXTRA_NOTIFICATION_ID, timestamp.toInt())
+                putExtra(CopyOtpReceiver.EXTRA_MESSAGE_TIMESTAMP, timestamp)
             }
             val pendingCopyIntent = PendingIntent.getBroadcast(
                 context,

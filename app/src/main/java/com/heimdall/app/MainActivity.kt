@@ -43,6 +43,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextStyle
@@ -63,7 +64,11 @@ import com.heimdall.app.util.ClickableLinkifiedText
 import com.heimdall.app.util.MessageCategory
 import com.heimdall.app.util.NotificationHelper
 import com.heimdall.app.util.OtpHelper
+import com.heimdall.app.util.SmsRoleHelper
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -101,6 +106,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefsManager = PreferencesManager(this)
+        NotificationHelper.createNotificationChannels(this)
         handleIntent(intent)
         enableEdgeToEdge()
         setContent {
@@ -112,6 +118,11 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        PreferencesManager.messagesVersion.longValue++
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -137,11 +148,26 @@ fun HeimdallApp(
     onDirectOpenConsumed: () -> Unit
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val messagesVersion by remember { PreferencesManager.messagesVersion }
+    var isDefaultSms by remember { mutableStateOf(SmsRoleHelper.isDefaultSmsApp(context)) }
     var currentScreen by remember { mutableStateOf(AppScreen.INBOX) }
     var inspectedLogs by remember { mutableStateOf(prefsManager.getInspectedMessages()) }
     var keywordsList by remember { mutableStateOf(prefsManager.getKeywords().sorted()) }
     var isMasterActive by remember { mutableStateOf(prefsManager.isMasterActive()) }
     var isFilterEnabled by remember { mutableStateOf(prefsManager.isFilterEnabled()) }
+    var isShowSpamInFeed by remember { mutableStateOf(prefsManager.isShowSpamInFeed()) }
+
+    val defaultSmsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        isDefaultSms = SmsRoleHelper.isDefaultSmsApp(context)
+    }
+
+    LaunchedEffect(messagesVersion) {
+        inspectedLogs = prefsManager.getInspectedMessages()
+        isDefaultSms = SmsRoleHelper.isDefaultSmsApp(context)
+    }
 
     // Instant O(1) Mapping directly from pre-computed fields
     val uiMessages = remember(inspectedLogs) {
@@ -191,10 +217,20 @@ fun HeimdallApp(
     }
 
     LaunchedEffect(currentScreen) {
+        isDefaultSms = SmsRoleHelper.isDefaultSmsApp(context)
         inspectedLogs = prefsManager.getInspectedMessages()
         keywordsList = prefsManager.getKeywords().sorted()
         isMasterActive = prefsManager.isMasterActive()
         isFilterEnabled = prefsManager.isFilterEnabled()
+        isShowSpamInFeed = prefsManager.isShowSpamInFeed()
+    }
+
+    // Run automatic spam cleanup (older than 30 days) when app is open and idle
+    LaunchedEffect(Unit) {
+        delay(2000L) // Wait 2s for UI to settle idle
+        withContext(Dispatchers.IO) {
+            prefsManager.cleanupOldSpam()
+        }
     }
 
     BackHandler(enabled = currentScreen == AppScreen.SETTINGS) {
@@ -209,6 +245,9 @@ fun HeimdallApp(
             onDelete = {
                 if (message.isSpam) {
                     prefsManager.deleteMessage(message.timestamp)
+                    coroutineScope.launch(Dispatchers.IO) {
+                        SmsRoleHelper.deleteFromTelephonyProvider(context, message.timestamp)
+                    }
                     inspectedLogs = prefsManager.getInspectedMessages()
                     selectedMessageForModal = null
                     Toast.makeText(context, "Spam message deleted", Toast.LENGTH_SHORT).show()
@@ -293,6 +332,9 @@ fun HeimdallApp(
                         Button(
                             onClick = {
                                 prefsManager.deleteMessage(msg.timestamp)
+                                coroutineScope.launch(Dispatchers.IO) {
+                                    SmsRoleHelper.deleteFromTelephonyProvider(context, msg.timestamp)
+                                }
                                 inspectedLogs = prefsManager.getInspectedMessages()
                                 cleanMessageToDelete = null
                                 Toast.makeText(context, "Message deleted", Toast.LENGTH_SHORT).show()
@@ -325,6 +367,7 @@ fun HeimdallApp(
             AppScreen.INBOX -> {
                 InboxScreen(
                     uiMessages = uiMessages,
+                    showSpamInFeed = isShowSpamInFeed,
                     onOpenSettings = { currentScreen = AppScreen.SETTINGS },
                     onSelectMessage = { message ->
                         prefsManager.markMessageAsRead(message.timestamp)
@@ -346,6 +389,8 @@ fun HeimdallApp(
                     prefsManager = prefsManager,
                     isMasterActive = isMasterActive,
                     isFilterEnabled = isFilterEnabled,
+                    isShowSpamInFeed = isShowSpamInFeed,
+                    isDefaultSms = isDefaultSms,
                     keywordsList = keywordsList,
                     messages = inspectedLogs,
                     onMasterToggle = { enabled ->
@@ -356,6 +401,13 @@ fun HeimdallApp(
                         isFilterEnabled = enabled
                         prefsManager.setFilterEnabled(enabled)
                     },
+                    onShowSpamInFeedToggle = { enabled ->
+                        isShowSpamInFeed = enabled
+                        prefsManager.setShowSpamInFeed(enabled)
+                    },
+                    onRequestDefaultSms = {
+                        defaultSmsLauncher.launch(SmsRoleHelper.createDefaultSmsIntent(context))
+                    },
                     onKeywordsUpdated = {
                         keywordsList = prefsManager.getKeywords().sorted()
                     },
@@ -365,9 +417,6 @@ fun HeimdallApp(
                         Toast.makeText(context, "Purged $count spam message(s)", Toast.LENGTH_SHORT).show()
                     },
                     onBack = { currentScreen = AppScreen.INBOX },
-                    onSimulateTest = { _ ->
-                        inspectedLogs = prefsManager.getInspectedMessages()
-                    },
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(innerPadding)
@@ -380,6 +429,7 @@ fun HeimdallApp(
 @Composable
 fun InboxScreen(
     uiMessages: List<UiMessageItem>,
+    showSpamInFeed: Boolean,
     onOpenSettings: () -> Unit,
     onSelectMessage: (InspectedMessage) -> Unit,
     onMarkAllAsRead: () -> Unit,
@@ -390,7 +440,9 @@ fun InboxScreen(
     var debouncedSearchQuery by remember { mutableStateOf("") }
     var visibleItemCount by remember { mutableIntStateOf(25) }
 
-    val unreadCount = remember(uiMessages) { uiMessages.count { !it.raw.isRead } }
+    val unreadCount = remember(uiMessages, showSpamInFeed) {
+        uiMessages.count { !it.raw.isRead && (showSpamInFeed || !it.raw.isSpam) }
+    }
 
     // 200ms Search Debounce
     LaunchedEffect(rawSearchQuery) {
@@ -398,19 +450,20 @@ fun InboxScreen(
         debouncedSearchQuery = rawSearchQuery
     }
 
-    // Reset pagination when search or unread filter changes
-    LaunchedEffect(debouncedSearchQuery, showOnlyUnread) {
+    // Reset pagination when search, unread, or showSpamInFeed changes
+    LaunchedEffect(debouncedSearchQuery, showOnlyUnread, showSpamInFeed) {
         visibleItemCount = 25
     }
 
-    val filteredMessages = remember(uiMessages, showOnlyUnread, debouncedSearchQuery) {
+    val filteredMessages = remember(uiMessages, showSpamInFeed, showOnlyUnread, debouncedSearchQuery) {
         uiMessages.filter { item ->
+            val matchesSpam = showSpamInFeed || !item.raw.isSpam
             val matchesUnread = !showOnlyUnread || !item.raw.isRead
             val query = debouncedSearchQuery.trim()
             val matchesSearch = query.isEmpty() ||
                     item.raw.sender.contains(query, ignoreCase = true) ||
                     item.raw.body.contains(query, ignoreCase = true)
-            matchesUnread && matchesSearch
+            matchesSpam && matchesUnread && matchesSearch
         }
     }
 
@@ -464,7 +517,7 @@ fun InboxScreen(
 
         HorizontalDivider(color = DarkBorder, thickness = 1.dp)
 
-        // Minimal Options Bar (Unread Filter Badge + Debounced Search Field)
+        // Minimal Options Bar (Search on Left + UNREAD Badge on Right)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -472,33 +525,7 @@ fun InboxScreen(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // Unread Filter Toggle Badge
-            Surface(
-                shape = RectangleShape,
-                color = if (showOnlyUnread) YellowAccent else DarkSurface,
-                border = androidx.compose.foundation.BorderStroke(
-                    1.dp,
-                    if (showOnlyUnread) YellowAccent else DarkBorder
-                ),
-                modifier = Modifier
-                    .height(36.dp)
-                    .clickable { showOnlyUnread = !showOnlyUnread }
-            ) {
-                Box(
-                    modifier = Modifier.padding(horizontal = 10.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = if (unreadCount > 0) "UNREAD ($unreadCount)" else "UNREAD",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                        color = if (showOnlyUnread) DarkBackground else if (unreadCount > 0) YellowAccent else TextMuted
-                    )
-                }
-            }
-
-            // Minimalist Search Bar with Real-time Debounce
+            // Minimalist Search Bar with Real-time Debounce on Left
             BasicTextField(
                 value = rawSearchQuery,
                 onValueChange = { rawSearchQuery = it },
@@ -533,7 +560,7 @@ fun InboxScreen(
                         Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
                             if (rawSearchQuery.isEmpty()) {
                                 Text(
-                                    text = "Search messages...",
+                                    text = "Search...",
                                     color = TextMuted,
                                     fontSize = 12.sp
                                 )
@@ -556,6 +583,32 @@ fun InboxScreen(
                     }
                 }
             )
+
+            // UNREAD Filter Toggle Badge on Right
+            Surface(
+                shape = RectangleShape,
+                color = if (showOnlyUnread) YellowAccent else DarkSurface,
+                border = androidx.compose.foundation.BorderStroke(
+                    1.dp,
+                    if (showOnlyUnread) YellowAccent else DarkBorder
+                ),
+                modifier = Modifier
+                    .height(36.dp)
+                    .clickable { showOnlyUnread = !showOnlyUnread }
+            ) {
+                Box(
+                    modifier = Modifier.padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = if (unreadCount > 0) "UNREAD ($unreadCount)" else "UNREAD",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (showOnlyUnread) DarkBackground else if (unreadCount > 0) YellowAccent else TextMuted
+                    )
+                }
+            }
         }
 
         HorizontalDivider(color = DarkBorder.copy(alpha = 0.5f), thickness = 1.dp)
@@ -807,6 +860,8 @@ fun MessageDetailModal(
     onDelete: () -> Unit
 ) {
     val context = LocalContext.current
+    val configuration = LocalConfiguration.current
+    val maxTextBoxHeight = (configuration.screenHeightDp * 0.50f).dp
     val fullTimeString = remember(message.timestamp) {
         synchronized(FULL_DATE_FORMAT) { FULL_DATE_FORMAT.format(Date(message.timestamp)) }
     }
@@ -893,7 +948,7 @@ fun MessageDetailModal(
                     border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(max = 240.dp)
+                        .heightIn(max = maxTextBoxHeight)
                 ) {
                     ClickableLinkifiedText(
                         text = message.body,
@@ -1030,13 +1085,16 @@ fun SettingsScreen(
     prefsManager: PreferencesManager,
     isMasterActive: Boolean,
     isFilterEnabled: Boolean,
+    isShowSpamInFeed: Boolean,
+    isDefaultSms: Boolean,
     keywordsList: List<String>,
     messages: List<InspectedMessage>,
     onMasterToggle: (Boolean) -> Unit,
     onFilterToggle: (Boolean) -> Unit,
+    onShowSpamInFeedToggle: (Boolean) -> Unit,
+    onRequestDefaultSms: () -> Unit,
     onKeywordsUpdated: () -> Unit,
     onDeleteAllSpam: () -> Unit,
-    onSimulateTest: (Boolean) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1059,71 +1117,6 @@ fun SettingsScreen(
             keyboardController?.hide()
             Toast.makeText(context, "Added '$trimmed'", Toast.LENGTH_SHORT).show()
         }
-    }
-
-    val onRunSimulation = { testType: String ->
-        val timestamp = System.currentTimeMillis()
-        var sender = "+919876543210"
-        var body = "Hey Rahul, are you free for a quick call today afternoon?"
-        var isSpamRequested = false
-
-        when (testType) {
-            "TRAVEL" -> {
-                sender = "INDIGO"
-                body = "Your IndiGo flight 6E-204 from BLR to DEL is confirmed. PNR: W8KJ9L. Terminal 2, Gate 4B."
-            }
-            "DELIVERY" -> {
-                sender = "CP-DCTHLN-S"
-                body = "Your order(30096214) is ready for pickup. Please use 5924 valid for 48 hours only during pick up. Share the OTP at CRM or drive-thru zone to collect your order."
-            }
-            "CARD" -> {
-                sender = "AD-AXISBK-S"
-                body = "Spent INR 418 on Axis Bank Card no. XX0665 at SWIGGY PVT. Avl Limit: INR 119709.88. SMS BLOCK 0665 to 919951860002"
-            }
-            "BANK" -> {
-                sender = "AX-FEDBNK-T"
-                body = "Debited Rs 4.24 from a/c XX8939 on 28AUG2026 16:03:46. Bal Rs 19216.98. Not you? Call 18004251199 -Federal Bank"
-            }
-            "OTP" -> {
-                sender = "JM-HDFCBK-S"
-                body = "OTP is 825849 for txn of INR 1998.00 at DECATHLON on HDFC Bank card ending 7952. Valid till 11:41. Do not share OTP."
-            }
-            "SPAM" -> {
-                sender = "987521376514"
-                body = "Congratulations! Your pre-approved personal loan of Rs. 5,00,000 is ready. Apply now."
-                isSpamRequested = true
-            }
-        }
-
-        // Only mark as spam if the Spam Filter sub-toggle is ON
-        val effectiveIsSpam = isSpamRequested && isFilterEnabled
-        val matched = if (effectiveIsSpam) "loan" else null
-
-        if (effectiveIsSpam) prefsManager.incrementBlockedCount()
-
-        val category = CategoryHelper.detectCategory(sender, body, effectiveIsSpam)
-
-        val msg = InspectedMessage(
-            timestamp = timestamp,
-            sender = sender,
-            body = body,
-            isSpam = effectiveIsSpam,
-            matchedKeyword = matched,
-            isRead = false,
-            category = category.name
-        )
-        prefsManager.addInspectedMessage(msg)
-        onSimulateTest(effectiveIsSpam)
-
-        NotificationHelper.showInspectionNotification(
-            context = context,
-            sender = sender,
-            body = body,
-            isSpam = effectiveIsSpam,
-            matchedKeyword = matched,
-            timestamp = timestamp
-        )
-        Toast.makeText(context, "Pushed $testType test alert", Toast.LENGTH_SHORT).show()
     }
 
     Column(modifier = modifier.fillMaxSize()) {
@@ -1290,6 +1283,182 @@ fun SettingsScreen(
                 }
             }
 
+            // Dedicated Default SMS App Card
+            item {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, DarkBorder, RectangleShape),
+                    shape = RectangleShape,
+                    color = DarkSurface
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            text = "// DEFAULT SMS APP",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace,
+                            letterSpacing = 1.sp,
+                            color = TextSecondary
+                        )
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .background(
+                                        if (isDefaultSms) Color(0xFF10B981) else YellowAccent,
+                                        CircleShape
+                                    )
+                            )
+                            Text(
+                                text = if (isDefaultSms) "HEIMDALL IS DEFAULT SMS APP" else "NOT DEFAULT SMS APP",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace,
+                                letterSpacing = 0.5.sp,
+                                color = if (isDefaultSms) Color(0xFF10B981) else YellowAccent
+                            )
+                        }
+
+                        Text(
+                            text = if (isDefaultSms) {
+                                "Spam is intercepted silently and kept out of system SMS storage. Clean messages sync automatically to Android's database."
+                            } else {
+                                "Set Heimdall as default SMS app to silently intercept spam, prevent spam from polluting system SMS, and enable system message deletion."
+                            },
+                            fontSize = 11.sp,
+                            color = TextMuted,
+                            lineHeight = 16.sp
+                        )
+
+                        if (isDefaultSms) {
+                            OutlinedButton(
+                                onClick = onRequestDefaultSms,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(42.dp),
+                                shape = RectangleShape,
+                                border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.SwapHoriz,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "SWITCH / MANAGE DEFAULT APP",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 11.sp,
+                                    letterSpacing = 1.sp
+                                )
+                            }
+                        } else {
+                            Button(
+                                onClick = onRequestDefaultSms,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(44.dp),
+                                shape = RectangleShape,
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = YellowAccent,
+                                    contentColor = DarkBackground
+                                )
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Shield,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                    tint = DarkBackground
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "SET AS DEFAULT SMS APP",
+                                    fontWeight = FontWeight.Black,
+                                    fontSize = 12.sp,
+                                    letterSpacing = 1.sp
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Dedicated Feed Preferences Section
+            item {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, DarkBorder, RectangleShape),
+                    shape = RectangleShape,
+                    color = DarkSurface
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            text = "// FEED PREFERENCES",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace,
+                            letterSpacing = 1.sp,
+                            color = TextSecondary
+                        )
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    text = "SHOW SPAM IN FEED",
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    letterSpacing = 0.5.sp,
+                                    color = TextPrimary
+                                )
+                                Text(
+                                    text = if (isShowSpamInFeed) "Spam SMS visible in main inbox" else "Spam SMS hidden from main inbox (default)",
+                                    fontSize = 11.sp,
+                                    color = TextMuted,
+                                    lineHeight = 15.sp
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(12.dp))
+
+                            Switch(
+                                checked = isShowSpamInFeed,
+                                onCheckedChange = onShowSpamInFeedToggle,
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = DarkBackground,
+                                    checkedTrackColor = YellowAccent,
+                                    uncheckedThumbColor = TextMuted,
+                                    uncheckedTrackColor = DarkSurfaceVariant
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+
             // Aligned Section: SPAM RULES
             item {
                 Surface(
@@ -1406,135 +1575,6 @@ fun SettingsScreen(
                                             Toast.makeText(context, "Removed '$keyword'", Toast.LENGTH_SHORT).show()
                                         }
                                     )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Test Notifications Section
-            item {
-                Surface(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .border(1.dp, DarkBorder, RectangleShape),
-                    shape = RectangleShape,
-                    color = DarkSurface
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Text(
-                            text = "// TEST NOTIFICATIONS",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace,
-                            letterSpacing = 1.sp,
-                            color = TextSecondary
-                        )
-
-                        // 6 test simulation buttons in 2 rows
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                Button(
-                                    onClick = { onRunSimulation("TRAVEL") },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = DarkSurfaceVariant,
-                                        contentColor = YellowAccent
-                                    ),
-                                    border = androidx.compose.foundation.BorderStroke(1.dp, YellowAccent.copy(alpha = 0.4f)),
-                                    shape = RectangleShape,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(44.dp)
-                                ) {
-                                    Text("TRVL ✈️", fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                                }
-
-                                Button(
-                                    onClick = { onRunSimulation("DELIVERY") },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = DarkSurfaceVariant,
-                                        contentColor = TextPrimary
-                                    ),
-                                    border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder),
-                                    shape = RectangleShape,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(44.dp)
-                                ) {
-                                    Text("PKG 📦", fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                                }
-
-                                Button(
-                                    onClick = { onRunSimulation("CARD") },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = DarkSurfaceVariant,
-                                        contentColor = TextPrimary
-                                    ),
-                                    border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder),
-                                    shape = RectangleShape,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(44.dp)
-                                ) {
-                                    Text("CARD 💳", fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                                }
-                            }
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                Button(
-                                    onClick = { onRunSimulation("BANK") },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = DarkSurfaceVariant,
-                                        contentColor = TextPrimary
-                                    ),
-                                    border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder),
-                                    shape = RectangleShape,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(44.dp)
-                                ) {
-                                    Text("BANK 🏦", fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                                }
-
-                                Button(
-                                    onClick = { onRunSimulation("OTP") },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = YellowAccent,
-                                        contentColor = DarkBackground
-                                    ),
-                                    shape = RectangleShape,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(44.dp)
-                                ) {
-                                    Text("OTP 🔑", fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                                }
-
-                                Button(
-                                    onClick = { onRunSimulation("SPAM") },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = DarkSurfaceVariant,
-                                        contentColor = TextPrimary
-                                    ),
-                                    border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder),
-                                    shape = RectangleShape,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(44.dp)
-                                ) {
-                                    Text("SPAM ⚠️", fontWeight = FontWeight.Bold, fontSize = 11.sp)
                                 }
                             }
                         }
